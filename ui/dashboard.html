@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Harmoniq — Finance Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+:root{
+  --bg:#0f1117;--surface:#1a1d27;--surface2:#22263a;
+  --border:#2e3250;--accent:#6c63ff;--accent2:#4fc3f7;
+  --green:#43e97b;--amber:#f7971e;--red:#ff6b6b;
+  --text:#e8eaf6;--muted:#8b90b0;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh}
+
+header{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:14px 28px;background:var(--surface);
+  border-bottom:1px solid var(--border);
+}
+.logo{display:flex;align-items:center;gap:10px;font-size:18px;font-weight:700}
+.logo-icon{width:34px;height:34px;background:linear-gradient(135deg,var(--accent),var(--accent2));border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:16px}
+.nav-links{display:flex;gap:8px}
+.nav-link{padding:6px 14px;border-radius:20px;font-size:13px;cursor:pointer;text-decoration:none;color:var(--muted);border:1px solid var(--border);background:var(--surface2);transition:all .2s}
+.nav-link:hover,.nav-link.active{color:var(--accent);border-color:var(--accent);background:rgba(108,99,255,.1)}
+
+.dashboard{padding:24px 28px;display:flex;flex-direction:column;gap:20px}
+
+/* Summary cards */
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px 20px}
+.card-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px}
+.card-value{font-size:24px;font-weight:700}
+.card-sub{font-size:12px;color:var(--muted);margin-top:4px}
+.card.income .card-value{color:var(--green)}
+.card.expense .card-value{color:var(--red)}
+.card.balance .card-value{color:var(--accent2)}
+.card.budget .card-value{color:var(--amber)}
+
+/* Charts row */
+.charts-row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.chart-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:20px}
+.chart-title{font-size:14px;font-weight:600;margin-bottom:16px;color:var(--text)}
+.chart-wrap{position:relative;height:260px}
+
+/* Bar chart full width */
+.chart-full{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:20px}
+.chart-full-wrap{position:relative;height:220px}
+
+/* Expense table */
+.table-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;overflow:hidden}
+.table-header{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border)}
+.table-title{font-size:14px;font-weight:600}
+.refresh-btn{padding:5px 12px;border-radius:8px;border:1px solid var(--border);background:var(--surface2);color:var(--muted);cursor:pointer;font-size:12px;transition:all .2s}
+.refresh-btn:hover{border-color:var(--accent);color:var(--accent)}
+table{width:100%;border-collapse:collapse}
+th{padding:10px 20px;font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);text-align:left;background:var(--surface2);font-weight:500}
+td{padding:11px 20px;font-size:13px;border-top:1px solid var(--border)}
+tr:hover td{background:rgba(108,99,255,.04)}
+.cat-badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:500}
+.cat-food{background:rgba(247,151,30,.15);color:#f7971e}
+.cat-groceries{background:rgba(67,233,123,.15);color:#43e97b}
+.cat-transport{background:rgba(79,195,247,.15);color:#4fc3f7}
+.cat-health{background:rgba(255,107,107,.15);color:#ff6b6b}
+.cat-utilities{background:rgba(108,99,255,.15);color:#9c95ff}
+.cat-entertainment{background:rgba(255,220,100,.15);color:#ffd700}
+.cat-work{background:rgba(200,200,200,.15);color:#aaa}
+.cat-other{background:rgba(150,150,150,.15);color:#888}
+.amount-neg{color:var(--red)}
+.amount-pos{color:var(--green)}
+.empty-state{padding:40px;text-align:center;color:var(--muted);font-size:14px}
+
+.loading{display:flex;align-items:center;justify-content:center;height:200px;color:var(--muted);font-size:14px}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">✦</div>
+    Harmoniq AI
+  </div>
+  <div class="nav-links">
+    <a class="nav-link" href="/">💬 Chat</a>
+    <a class="nav-link active" href="/dashboard.html">📊 Dashboard</a>
+  </div>
+</header>
+
+<div class="dashboard">
+
+  <!-- Summary Cards -->
+  <div class="cards">
+    <div class="card income">
+      <div class="card-label">Total Income</div>
+      <div class="card-value" id="total-income">₹0</div>
+      <div class="card-sub" id="income-sub">This month</div>
+    </div>
+    <div class="card expense">
+      <div class="card-label">Total Expenses</div>
+      <div class="card-value" id="total-expense">₹0</div>
+      <div class="card-sub" id="expense-sub">This month</div>
+    </div>
+    <div class="card balance">
+      <div class="card-label">Net Balance</div>
+      <div class="card-value" id="net-balance">₹0</div>
+      <div class="card-sub" id="balance-sub">Income - Expenses</div>
+    </div>
+    <div class="card budget">
+      <div class="card-label">Budget Used</div>
+      <div class="card-value" id="budget-used">0%</div>
+      <div class="card-sub" id="budget-sub">of monthly limit</div>
+    </div>
+  </div>
+
+  <!-- Pie + Donut Charts -->
+  <div class="charts-row">
+    <div class="chart-card">
+      <div class="chart-title">💰 Expenses by Category</div>
+      <div class="chart-wrap">
+        <canvas id="expense-pie"></canvas>
+      </div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">📈 Budget Usage</div>
+      <div class="chart-wrap">
+        <canvas id="budget-doughnut"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- Daily Spend Bar Chart -->
+  <div class="chart-full">
+    <div class="chart-title">📅 Daily Spending — Last 7 Days</div>
+    <div class="chart-full-wrap">
+      <canvas id="daily-bar"></canvas>
+    </div>
+  </div>
+
+  <!-- Recent Transactions Table -->
+  <div class="table-card">
+    <div class="table-header">
+      <div class="table-title">🧾 Recent Transactions</div>
+      <button class="refresh-btn" onclick="loadData()">↻ Refresh</button>
+    </div>
+    <div id="table-body">
+      <div class="loading">Loading transactions...</div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const CHART_COLORS = [
+  '#6c63ff','#4fc3f7','#43e97b','#f7971e',
+  '#ff6b6b','#ffd700','#a78bfa','#34d399'
+];
+
+let pieChart     = null;
+let doughnutChart = null;
+let barChart     = null;
+
+async function loadData() {
+  const data = await loadRealData();
+  renderDashboard(data);
+}
+
+async function fetchFirestoreData() {
+  // Call our proxy which talks to ADK
+  // We use a lightweight direct fetch approach
+  const resp = await fetch('/api/apps/harmoniq_app/users/user/sessions');
+  
+  // For the dashboard, we query Firestore-backed data
+  // through the ADK state endpoint
+  return getDemoData(); // Will be replaced with real data
+}
+
+function getDemoData() {
+  // Returns structure from actual Firestore via ADK
+  return {
+    expenses: [],
+    income: [],
+    budget: 10000,
+    byCategory: {},
+    dailyTotals: {},
+    totalExpense: 0,
+    totalIncome: 0
+  };
+}
+
+async function getSession() {
+  const r = await fetch('/api/apps/harmoniq_app/users/user/sessions', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: '{}'
+  });
+  const d = await r.json();
+  return d.id || d.session_id;
+}
+
+async function callAgent(sid, message) {
+  const r = await fetch('/api/run_sse', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      app_name:    'harmoniq_app',
+      user_id:     'user',
+      session_id:  sid,
+      new_message: {role: 'user', parts: [{text: message}]},
+      streaming:   false
+    })
+  });
+  return r.text();
+}
+
+// ── RENDER FUNCTIONS ─────────────────────────────────────────
+
+function renderDashboard(data) {
+  updateCards(data);
+  renderPieChart(data.byCategory);
+  renderDoughnutChart(data.totalExpense, data.budget);
+  renderBarChart(data.dailyTotals);
+  renderTable(data.expenses, data.income);
+}
+
+function updateCards(data) {
+  const inc = data.totalIncome  || 0;
+  const exp = data.totalExpense || 0;
+  const bud = data.budget       || 10000;
+  const net = inc - exp;
+  const pct = Math.min(Math.round((exp / bud) * 100), 100);
+
+  document.getElementById('total-income').textContent  = fmt(inc);
+  document.getElementById('total-expense').textContent = fmt(exp);
+  document.getElementById('net-balance').textContent   = fmt(net);
+  document.getElementById('budget-used').textContent   = pct + '%';
+
+  const balEl = document.getElementById('net-balance');
+  balEl.style.color = net >= 0 ? 'var(--green)' : 'var(--red)';
+
+  const budEl = document.getElementById('budget-used');
+  budEl.style.color = pct > 90 ? 'var(--red)' : pct > 70 ? 'var(--amber)' : 'var(--green)';
+
+  document.getElementById('budget-sub').textContent =
+    'of ' + fmt(bud) + ' limit';
+}
+
+function renderPieChart(byCategory) {
+  const labels = Object.keys(byCategory);
+  const values = Object.values(byCategory);
+
+  if (pieChart) pieChart.destroy();
+
+  if (!labels.length) {
+    document.getElementById('expense-pie').parentElement.innerHTML =
+      '<div class="empty-state">No expenses yet this month</div>';
+    return;
+  }
+
+  pieChart = new Chart(
+    document.getElementById('expense-pie'),
+    {
+      type: 'doughnut',
+      data: {
+        labels,
+        datasets: [{
+          data:            values,
+          backgroundColor: CHART_COLORS.slice(0, labels.length),
+          borderColor:     '#1a1d27',
+          borderWidth:     3,
+          hoverOffset:     6
+        }]
+      },
+      options: {
+        responsive:          true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            position: 'bottom',
+            labels: {
+              color:     '#8b90b0',
+              font:      {size: 11},
+              padding:   12,
+              boxWidth:  12,
+              boxHeight: 12
+            }
+          },
+          tooltip: {
+            callbacks: {
+              label: ctx => ' ' + ctx.label + ': ₹' + ctx.parsed.toLocaleString()
+            }
+          }
+        },
+        cutout: '62%'
+      }
+    }
+  );
+}
+
+function renderDoughnutChart(spent, budget) {
+  if (doughnutChart) doughnutChart.destroy();
+
+  const remaining = Math.max(budget - spent, 0);
+  const over      = Math.max(spent - budget, 0);
+  const pct       = Math.round((spent / budget) * 100);
+
+  doughnutChart = new Chart(
+    document.getElementById('budget-doughnut'),
+    {
+      type: 'doughnut',
+      data: {
+        labels:   ['Spent', 'Remaining'],
+        datasets: [{
+          data:            over > 0 ? [spent, 0] : [spent, remaining],
+          backgroundColor: [
+            pct > 90 ? '#ff6b6b' : pct > 70 ? '#f7971e' : '#6c63ff',
+            '#2e3250'
+          ],
+          borderColor:  '#1a1d27',
+          borderWidth:  3
+        }]
+      },
+      options: {
+        responsive:          true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            position: 'bottom',
+            labels: {color: '#8b90b0', font: {size: 11}, padding: 12, boxWidth: 12}
+          },
+          tooltip: {
+            callbacks: {
+              label: ctx => ' ' + ctx.label + ': ₹' + ctx.parsed.toLocaleString()
+            }
+          }
+        },
+        cutout: '62%'
+      }
+    }
+  );
+}
+
+function renderBarChart(dailyTotals) {
+  if (barChart) barChart.destroy();
+
+  // Generate last 7 days
+  const labels = [];
+  const values = [];
+  for (let i = 6; i >= 0; i--) {
+    const d   = new Date();
+    d.setDate(d.getDate() - i);
+    const key = d.toISOString().split('T')[0];
+    const lbl = d.toLocaleDateString('en-IN', {weekday:'short', day:'numeric'});
+    labels.push(lbl);
+    values.push(dailyTotals[key] || 0);
+  }
+
+  barChart = new Chart(
+    document.getElementById('daily-bar'),
+    {
+      type: 'bar',
+      data: {
+        labels,
+        datasets: [{
+          label:           'Daily Spend (₹)',
+          data:            values,
+          backgroundColor: values.map(v =>
+            v === 0 ? 'rgba(108,99,255,0.15)' : 'rgba(108,99,255,0.7)'
+          ),
+          borderColor:     '#6c63ff',
+          borderWidth:     1,
+          borderRadius:    6,
+          borderSkipped:   false
+        }]
+      },
+      options: {
+        responsive:          true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {display: false},
+          tooltip: {
+            callbacks: {
+              label: ctx => ' ₹' + ctx.parsed.y.toLocaleString()
+            }
+          }
+        },
+        scales: {
+          x: {
+            grid:  {color: 'rgba(46,50,80,0.5)'},
+            ticks: {color: '#8b90b0', font: {size: 11}}
+          },
+          y: {
+            grid:  {color: 'rgba(46,50,80,0.5)'},
+            ticks: {
+              color:    '#8b90b0',
+              font:     {size: 11},
+              callback: v => '₹' + v.toLocaleString()
+            },
+            beginAtZero: true
+          }
+        }
+      }
+    }
+  );
+}
+
+function renderTable(expenses, income) {
+  const tbody = document.getElementById('table-body');
+
+  // Combine and sort by date
+  const all = [
+    ...expenses.map(e => ({...e, txn_type: 'expense'})),
+    ...income.map(i => ({...i, txn_type: 'income'}))
+  ].sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+
+  if (!all.length) {
+    tbody.innerHTML = '<div class="empty-state">No transactions yet — start logging expenses!</div>';
+    return;
+  }
+
+  const rows = all.slice(0, 20).map(t => {
+    const cat   = (t.category || t.source || 'other').toLowerCase();
+    const isInc = t.txn_type === 'income';
+    const amt   = isInc
+      ? '<span class="amount-pos">+₹' + (t.amount || 0).toLocaleString() + '</span>'
+      : '<span class="amount-neg">-₹' + (t.amount || 0).toLocaleString() + '</span>';
+
+    return `<tr>
+      <td>${t.date || '-'}</td>
+      <td><span class="cat-badge cat-${cat}">${cat}</span></td>
+      <td>${t.description || t.source || '-'}</td>
+      <td>${amt}</td>
+      <td style="color:var(--muted)">${t.currency || 'INR'}</td>
+    </tr>`;
+  }).join('');
+
+  tbody.innerHTML = `
+    <table>
+      <thead>
+        <tr>
+          <th>Date</th><th>Category</th>
+          <th>Description</th><th>Amount</th><th>Currency</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function fmt(n) {
+  return '₹' + Math.abs(n).toLocaleString('en-IN');
+}
+
+
+
+// ── INIT ─────────────────────────────────────────────────────
+async function loadRealData() {
+  try {
+    const r = await fetch('/data/summary');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    console.log('Dashboard data:', data);
+    return {
+      totalExpense: data.total_expense || 0,
+      totalIncome:  data.total_income  || 0,
+      budget:       data.budget        || 10000,
+      byCategory:   data.by_category   || {},
+      dailyTotals:  data.daily_totals  || {},
+      expenses:     data.recent_expenses || [],
+      income:       data.recent_income   || []
+    };
+  } catch(e) {
+    console.error('Data load error:', e);
+    return {
+      totalExpense:0, totalIncome:0, budget:10000,
+      byCategory:{}, dailyTotals:{}, expenses:[], income:[]
+    };
+  }
+}
+
+window.onload = async () => {
+  const data = await loadRealData();
+  renderDashboard(data);
+  setInterval(async () => {
+    renderDashboard(await loadRealData());
+  }, 15000);
+};
+</script>
+</body>
+</html>

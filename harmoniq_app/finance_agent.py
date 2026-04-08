@@ -1,0 +1,444 @@
+import os
+import urllib.request
+import json as _json
+from datetime import datetime, date
+import calendar as cal_lib
+from google.adk.agents import Agent
+from google.adk.tools.tool_context import ToolContext
+from harmoniq_app.firestore_tools import (
+    log_expense, log_income, get_monthly_expenses,
+    get_balance_summary, delete_expense, delete_all_expenses
+)
+from harmoniq_app.google_api_client import get_sheets_service, get_docs_service, get_drive_service
+from google.cloud import pubsub_v1
+
+BUDGET_LIMIT = float(os.getenv("MONTHLY_BUDGET_INR", "10000"))
+PROJECT_ID   = os.getenv("PROJECT_ID", "harmoniq-ai-nm")
+PUBSUB_TOPIC = os.getenv("PUBSUB_TOPIC", "harmoniq-budget-alerts")
+SHEET_ID     = os.getenv("SHEETS_EXPENSE_ID", "")
+
+
+# ── SHEETS SYNC ──────────────────────────────────────────────
+
+def sync_expense_to_sheet(tool_context: ToolContext) -> dict:
+    """Appends the last logged expense to Google Sheets."""
+    try:
+        sheet_id = os.getenv("SHEETS_EXPENSE_ID", "")
+        if not sheet_id:
+            return {"status": "error", "message": "SHEETS_EXPENSE_ID not set."}
+        if not tool_context.state.get("last_expense_id"):
+            return {"status": "skipped", "message": "No recent expense to sync."}
+
+        from google.cloud import firestore
+        db  = firestore.Client()
+        doc = db.collection("expenses").document(
+            tool_context.state["last_expense_id"]
+        ).get().to_dict()
+
+        if not doc:
+            return {"status": "error", "message": "Expense not found in Firestore."}
+
+        row = [[
+            doc.get("id", ""),
+            doc.get("date", ""),
+            doc.get("category", ""),
+            doc.get("description", ""),
+            doc.get("amount", 0),
+            doc.get("currency", "INR"),
+            doc.get("user_id", "")
+        ]]
+
+        svc = get_sheets_service()
+        svc.spreadsheets().values().append(
+            spreadsheetId=sheet_id,
+            range="Expenses!A:G",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": row}
+        ).execute()
+
+        sheet_url = "https://docs.google.com/spreadsheets/d/" + sheet_id
+        return {"status": "success", "message": "Expense synced to Google Sheets.", "sheet_url": sheet_url}
+    except Exception as e:
+        return {"status": "error", "message": "Sheets sync failed: " + str(e)}
+
+
+
+
+def sync_income_to_sheet(tool_context: ToolContext) -> dict:
+    """Appends the last logged income to Google Sheets income tab."""
+    try:
+        sheet_id = os.getenv("SHEETS_EXPENSE_ID", "")
+        if not sheet_id:
+            return {"status": "error", "message": "SHEETS_EXPENSE_ID not set."}
+        if not tool_context.state.get("last_income_id"):
+            return {"status": "skipped", "message": "No recent income to sync."}
+
+        from google.cloud import firestore
+        db  = firestore.Client()
+        doc = db.collection("income").document(
+            tool_context.state["last_income_id"]
+        ).get().to_dict()
+
+        if not doc:
+            return {"status": "error", "message": "Income not found in Firestore."}
+
+        row = [[
+            doc.get("id", ""),
+            doc.get("date", ""),
+            doc.get("source", ""),
+            doc.get("description", ""),
+            doc.get("amount", 0),
+            doc.get("currency", "INR"),
+            doc.get("user_id", "")
+        ]]
+
+        svc = get_sheets_service()
+
+        # Try to append to Income tab — create it if missing
+        try:
+            svc.spreadsheets().values().append(
+                spreadsheetId=sheet_id,
+                range="Income!A:G",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": row}
+            ).execute()
+        except Exception:
+            # Income tab doesn't exist — add it
+            svc.spreadsheets().batchUpdate(
+                spreadsheetId=sheet_id,
+                body={"requests": [{"addSheet": {"properties": {"title": "Income"}}}]}
+            ).execute()
+            # Add headers
+            svc.spreadsheets().values().update(
+                spreadsheetId=sheet_id,
+                range="Income!A1:G1",
+                valueInputOption="RAW",
+                body={"values": [["ID","Date","Source","Description","Amount","Currency","User"]]}
+            ).execute()
+            # Now append
+            svc.spreadsheets().values().append(
+                spreadsheetId=sheet_id,
+                range="Income!A:G",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": row}
+            ).execute()
+
+        return {"status": "success", "message": "Income synced to Google Sheets."}
+    except Exception as e:
+        return {"status": "error", "message": "Income sheet sync failed: " + str(e)}
+
+# ── BUDGET ALERT ─────────────────────────────────────────────
+
+def check_budget_and_alert(tool_context: ToolContext) -> dict:
+    """Checks monthly spend vs budget, fires Pub/Sub alert if exceeded."""
+    monthly_total = tool_context.state.get("monthly_total", 0)
+    budget        = tool_context.state.get("budget_limit", BUDGET_LIMIT)
+
+    if monthly_total > budget:
+        try:
+            publisher  = pubsub_v1.PublisherClient()
+            topic_path = publisher.topic_path(PROJECT_ID, PUBSUB_TOPIC)
+            msg        = "BUDGET ALERT: spent " + str(monthly_total) + " exceeds limit " + str(budget)
+            publisher.publish(topic_path, msg.encode())
+        except Exception as e:
+            return {"status": "error", "message": "Pub/Sub error: " + str(e)}
+
+        tool_context.state["budget_exceeded"] = True
+        remaining = budget - monthly_total
+        return {
+            "status":  "alert_sent",
+            "total":   monthly_total,
+            "limit":   budget,
+            "message": "Budget exceeded! Spent " + str(monthly_total) + " vs limit " + str(budget)
+        }
+
+    remaining = budget - monthly_total
+    return {
+        "status":    "within_budget",
+        "total":     monthly_total,
+        "limit":     budget,
+        "remaining": remaining,
+        "message":   "Within budget. Spent " + str(monthly_total) + ", remaining " + str(remaining)
+    }
+
+
+# ── CURRENCY CONVERSION ──────────────────────────────────────
+
+def convert_currency(
+    tool_context: ToolContext,
+    amount: float,
+    from_currency: str = "INR",
+    to_currency: str = "USD"
+) -> dict:
+    """Converts currency using live rates from open.er-api.com (free, no API key)."""
+    try:
+        from_c = from_currency.upper()
+        to_c   = to_currency.upper()
+        url    = "https://open.er-api.com/v6/latest/" + from_c
+
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            data = _json.loads(resp.read())
+
+        if data.get("result") != "success":
+            return {"status": "error", "message": "Currency API unavailable."}
+        if to_c not in data["rates"]:
+            return {"status": "error", "message": "Unknown currency: " + to_c}
+
+        rate      = data["rates"][to_c]
+        converted = round(amount * rate, 2)
+
+        tool_context.state["last_conversion"] = {
+            "from": str(amount) + " " + from_c,
+            "to":   str(converted) + " " + to_c,
+            "rate": rate
+        }
+        msg = str(amount) + " " + from_c + " = " + str(converted) + " " + to_c
+        return {
+            "status":    "success",
+            "original":  str(amount) + " " + from_c,
+            "converted": str(converted) + " " + to_c,
+            "rate":      "1 " + from_c + " = " + str(round(rate, 6)) + " " + to_c,
+            "message":   msg
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+# ── SPENDING INSIGHTS ────────────────────────────────────────
+
+def get_spending_insights(tool_context: ToolContext) -> dict:
+    """Analyzes spending — top category, daily average, projection."""
+    try:
+        from google.cloud import firestore
+
+        db            = firestore.Client()
+        current_month = datetime.utcnow().strftime("%Y-%m")
+        expenses      = [
+            d.to_dict() for d in db.collection("expenses").stream()
+            if d.to_dict().get("date", "").startswith(current_month)
+        ]
+
+        if not expenses:
+            return {"status": "success", "message": "No expenses this month yet.", "insights": {}}
+
+        budget = tool_context.state.get("budget_limit", BUDGET_LIMIT)
+        total  = sum(e["amount"] for e in expenses)
+        by_cat = {}
+        for e in expenses:
+            cat        = e.get("category", "other")
+            by_cat[cat] = by_cat.get(cat, 0) + e["amount"]
+
+        top_category  = max(by_cat, key=by_cat.get)
+        biggest       = max(expenses, key=lambda x: x["amount"])
+        today_date    = date.today()
+        days_elapsed  = today_date.day
+        daily_avg     = total / days_elapsed if days_elapsed else 0
+        days_in_month = cal_lib.monthrange(today_date.year, today_date.month)[1]
+        projected     = daily_avg * days_in_month
+
+        insights = {
+            "total_spent":           "Rs " + str(int(total)),
+            "top_category":          top_category + " (Rs " + str(int(by_cat[top_category])) + ")",
+            "biggest_expense":       "Rs " + str(biggest["amount"]) + " on " + biggest.get("description", biggest["category"]),
+            "daily_average":         "Rs " + str(int(daily_avg)) + "/day",
+            "projected_month_total": "Rs " + str(int(projected)),
+            "budget_limit":          "Rs " + str(int(budget)),
+            "on_track":              projected <= budget,
+            "breakdown": {
+                k: "Rs " + str(int(v))
+                for k, v in sorted(by_cat.items(), key=lambda x: x[1], reverse=True)
+            }
+        }
+
+        tool_context.state["insights"] = insights
+        advice = "Projected to exceed budget!" if projected > budget else "On track to stay within budget."
+        return {"status": "success", "insights": insights, "advice": advice}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+# ── MONTHLY REPORT ───────────────────────────────────────────
+
+def generate_monthly_report(tool_context: ToolContext) -> dict:
+    """Generates a formatted monthly expense report as a Google Doc."""
+    try:
+        insights = tool_context.state.get("insights", {})
+        month    = datetime.utcnow().strftime("%B %Y")
+        docs     = get_docs_service()
+        drive    = get_drive_service()
+
+        title  = "Harmoniq Finance Report - " + month
+        doc    = docs.documents().create(body={"title": title}).execute()
+        doc_id = doc["documentId"]
+
+        breakdown_text = "\n".join([
+            "  - " + cat + ": " + amt
+            for cat, amt in insights.get("breakdown", {}).items()
+        ])
+
+        report_text = (
+            "HARMONIQ FINANCE REPORT\n" +
+            month + "\n" +
+            "=" * 40 + "\n\n" +
+            "SUMMARY\n" +
+            "Total Spent       : " + insights.get("total_spent", "N/A") + "\n" +
+            "Daily Average     : " + insights.get("daily_average", "N/A") + "\n" +
+            "Projected Total   : " + insights.get("projected_month_total", "N/A") + "\n" +
+            "Budget Limit      : " + insights.get("budget_limit", "N/A") + "\n" +
+            "Status            : " + ("On Track" if insights.get("on_track") else "Over Budget") + "\n\n" +
+            "TOP CATEGORY\n" + insights.get("top_category", "N/A") + "\n\n" +
+            "BIGGEST EXPENSE\n" + insights.get("biggest_expense", "N/A") + "\n\n" +
+            "BREAKDOWN BY CATEGORY\n" +
+            (breakdown_text if breakdown_text else "No data") + "\n\n" +
+            "=" * 40 + "\n" +
+            "Generated by Harmoniq AI\n"
+        )
+
+        docs.documents().batchUpdate(
+            documentId=doc_id,
+            body={"requests": [{"insertText": {"location": {"index": 1}, "text": report_text}}]}
+        ).execute()
+
+        drive.permissions().create(
+            fileId=doc_id,
+            body={
+                "type":         "user",
+                "role":         "writer",
+                "emailAddress": os.getenv("CALENDAR_OWNER", "future.mathur@gmail.com")
+            },
+            sendNotificationEmail=False
+        ).execute()
+
+        doc_url = "https://docs.google.com/document/d/" + doc_id + "/edit"
+        tool_context.state["report_url"] = doc_url
+        return {"status": "success", "doc_url": doc_url, "message": "Monthly report generated: " + title}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+# ── BUDGET MANAGEMENT ─────────────────────────────────────────
+
+def set_budget(tool_context: ToolContext, amount: float, currency: str = "INR") -> dict:
+    """Sets or updates the user monthly budget. Saves to Firestore."""
+    from google.cloud import firestore as _fs
+    _db = _fs.Client()
+    _db.collection("settings").document("budget").set({
+        "monthly_limit": amount,
+        "currency":      currency.upper(),
+        "updated_at":    datetime.utcnow().isoformat()
+    })
+    os.environ["MONTHLY_BUDGET_INR"] = str(amount)
+    tool_context.state["budget_limit"] = amount
+    return {
+        "status":  "success",
+        "message": "Monthly budget set to " + currency.upper() + " " + str(int(amount))
+    }
+
+
+def get_budget(tool_context: ToolContext) -> dict:
+    """Gets the current budget setting from Firestore."""
+    from google.cloud import firestore as _fs
+    _db = _fs.Client()
+    doc = _db.collection("settings").document("budget").get()
+    if doc.exists:
+        data  = doc.to_dict()
+        limit = data.get("monthly_limit", 10000)
+        cur   = data.get("currency", "INR")
+    else:
+        limit = float(os.getenv("MONTHLY_BUDGET_INR", "10000"))
+        cur   = "INR"
+    tool_context.state["budget_limit"] = limit
+    return {
+        "status":  "success",
+        "budget":  cur + " " + str(int(limit)),
+        "message": "Current monthly budget: " + cur + " " + str(int(limit))
+    }
+
+
+# ── AGENT DEFINITION ─────────────────────────────────────────
+
+finance_agent = Agent(
+    name="finance_agent",
+    model=os.getenv("MODEL", "gemini-2.5-flash"),
+    description=(
+        "Logs expenses and income, tracks budgets, converts currencies, "
+        "calculates balance, generates insights and monthly reports."
+    ),
+    instruction="""
+    You are the Finance Manager for Harmoniq. You handle ALL money-related requests.
+
+    CRITICAL:
+    If any tool returns status="error", you MUST show the error message exactly as returned.
+    Do NOT hide or summarize errors.
+
+    ON FIRST EXPENSE OF SESSION — check budget first:
+      1. get_budget() — if no budget set (returns default 10000),
+         ask user: "I notice you haven't set a monthly budget yet.
+         What would you like your monthly budget to be?"
+         Then call set_budget() with their answer before proceeding.
+
+    For NEW EXPENSE — required fields: amount + category only.
+      - If amount missing: ask for it
+      - If category missing: ask for it
+      - date: default to today if not mentioned
+      - currency: default INR if not mentioned
+      - description/notes: default to empty if not mentioned
+      Run in order:
+      1. log_expense
+      2. sync_expense_to_sheet
+      3. get_monthly_expenses
+      4. check_budget_and_alert
+
+    For INCOME logging — run in order:
+      1. log_income (amount, source, description="", currency="INR", date=today)
+      2. sync_income_to_sheet
+
+    For BALANCE — run:
+      1. get_balance_summary (shows income vs expenses net)
+
+    For SUMMARY/INSIGHTS:
+      1. get_monthly_expenses
+      2. get_spending_insights
+      3. check_budget_and_alert
+
+    For CURRENCY CONVERSION:
+      1. convert_currency (extract amount, from_currency, to_currency)
+
+    For MONTHLY REPORT:
+      1. get_monthly_expenses
+      2. get_spending_insights
+      3. generate_monthly_report
+
+    For BUDGET management:
+      - "set budget to X" → set_budget(amount, currency)
+      - "what is my budget" → get_budget()
+
+    For DELETE:
+      - "delete expense X" → delete_expense(expense_id)
+      - "delete all expenses" → CONFIRM first, then delete_all_expenses()
+
+    NEVER show the Google Sheets URL unless the user explicitly asks for it.
+    Present numbers cleanly with currency symbol.
+    Keep responses concise — confirm action in 1-2 lines max.
+    """,
+    tools=[
+        log_expense,
+        log_income,
+        sync_income_to_sheet,
+        get_balance_summary,
+        sync_expense_to_sheet,
+        get_monthly_expenses,
+        check_budget_and_alert,
+        convert_currency,
+        get_spending_insights,
+        generate_monthly_report,
+        delete_expense,
+        delete_all_expenses,
+        set_budget,
+        get_budget,
+    ],
+    output_key="finance_result"
+)

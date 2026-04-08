@@ -1,0 +1,239 @@
+import uuid
+import os
+from datetime import datetime
+from google.cloud import firestore, bigquery
+from google.adk.tools.tool_context import ToolContext
+
+db         = firestore.Client()
+bq_client  = bigquery.Client(project=os.getenv("PROJECT_ID", "harmoniq-ai-nm"))
+BQ_DATASET = "harmoniq_analytics"
+
+
+def _sync_to_bigquery(table_name: str, row: dict):
+    """Silently syncs a row to BigQuery."""
+    try:
+        table_ref = f"{os.getenv('PROJECT_ID', 'harmoniq-ai-nm')}.{BQ_DATASET}.{table_name}"
+        errors    = bq_client.insert_rows_json(table_ref, [row])
+        if errors:
+            print(f"[BQ sync warning] {errors}")
+    except Exception as e:
+        print(f"[BQ sync skipped] {e}")
+
+
+# ── TASK TOOLS ───────────────────────────────────────────────
+
+def create_task(
+    tool_context: ToolContext,
+    title: str,
+    due_date: str,
+    category: str = "general"
+) -> dict:
+    """Creates a new task in Firestore and syncs to BigQuery."""
+    task_id = str(uuid.uuid4())[:8]
+    now     = datetime.utcnow()
+    task    = {
+        "id":         task_id,
+        "title":      title,
+        "status":     "pending",
+        "due_date":   due_date,
+        "category":   category,
+        "project_id": tool_context.state.get("active_project_id"),
+        "created_at": now.isoformat()
+    }
+    db.collection("tasks").document(task_id).set(task)
+    _sync_to_bigquery("tasks", {**task, "created_at": now.isoformat() + "Z"})
+    tool_context.state["last_task_id"] = task_id
+    return {"status": "success", "task_id": task_id, "task": task,
+            "message": f"✅ Task '{title}' created (due {due_date})"}
+
+
+def list_tasks(tool_context: ToolContext, status: str = "pending") -> dict:
+    """Lists tasks filtered by status."""
+    docs  = db.collection("tasks").where("status", "==", status).stream()
+    tasks = [doc.to_dict() for doc in docs]
+    return {"status": "success", "tasks": tasks, "count": len(tasks)}
+
+
+def update_task_status(
+    tool_context: ToolContext,
+    task_id: str,
+    new_status: str
+) -> dict:
+    """Updates a task status: pending / in_progress / done."""
+    db.collection("tasks").document(task_id).update({"status": new_status})
+    return {"status": "success", "task_id": task_id, "new_status": new_status}
+
+
+def delete_task(tool_context: ToolContext, task_id: str) -> dict:
+    """Deletes a specific task by ID."""
+    db.collection("tasks").document(task_id).delete()
+    return {"status": "success", "message": f"✅ Task {task_id} deleted."}
+
+
+def delete_all_tasks(tool_context: ToolContext) -> dict:
+    """Deletes ALL tasks. Use with confirmation only."""
+    docs    = db.collection("tasks").stream()
+    deleted = 0
+    for doc in docs:
+        doc.reference.delete()
+        deleted += 1
+    return {"status": "success", "message": f"✅ Deleted {deleted} tasks."}
+
+
+# ── EXPENSE TOOLS ────────────────────────────────────────────
+
+def log_expense(
+    tool_context: ToolContext,
+    amount: float,
+    category: str,
+    description: str = "",
+    currency: str = "INR",
+    date: str = ""
+) -> dict:
+    """
+    Logs an expense to Firestore and streams to BigQuery.
+    Always ask user for amount, category, and description before logging.
+    currency defaults to INR. date defaults to today if not provided.
+    """
+    expense_id = str(uuid.uuid4())[:8]
+    now        = datetime.utcnow()
+    log_date   = date if date else now.date().isoformat()
+
+    expense = {
+        "id":          expense_id,
+        "amount":      float(amount),
+        "currency":    currency.upper(),
+        "category":    category.lower(),
+        "description": description,
+        "date":        log_date,
+        "type":        "expense",
+        "project_id":  tool_context.state.get("active_project_id"),
+        "user_id":     "user001",
+        "created_at":  now.isoformat()
+    }
+    db.collection("expenses").document(expense_id).set(expense)
+    _sync_to_bigquery("expenses", {**expense, "created_at": now.isoformat() + "Z"})
+    tool_context.state["last_expense_id"] = expense_id
+    return {
+        "status":     "success",
+        "expense_id": expense_id,
+        "expense":    expense,
+        "message":    f"✅ Logged {currency} {amount} for {description or category} on {log_date}"
+    }
+
+
+def log_income(
+    tool_context: ToolContext,
+    amount: float,
+    source: str,
+    description: str = "",
+    currency: str = "INR",
+    date: str = ""
+) -> dict:
+    """
+    Logs an income entry — salary, freelance, rental, etc.
+    Stored separately from expenses for balance calculation.
+    """
+    income_id = str(uuid.uuid4())[:8]
+    now       = datetime.utcnow()
+    log_date  = date if date else now.date().isoformat()
+
+    income = {
+        "id":          income_id,
+        "amount":      float(amount),
+        "currency":    currency.upper(),
+        "source":      source,
+        "description": description,
+        "date":        log_date,
+        "type":        "income",
+        "user_id":     "user001",
+        "created_at":  now.isoformat()
+    }
+    db.collection("income").document(income_id).set(income)
+    tool_context.state["last_income_id"] = income_id
+    return {
+        "status":    "success",
+        "income_id": income_id,
+        "income":    income,
+        "message":   f"✅ Logged income: {currency} {amount} from {source} on {log_date}"
+    }
+
+
+def get_monthly_expenses(tool_context: ToolContext) -> dict:
+    """Gets total expenses for the current month grouped by category."""
+    current_month = datetime.utcnow().strftime("%Y-%m")
+    docs          = db.collection("expenses").stream()
+    total         = 0.0
+    by_category   = {}
+
+    for doc in docs:
+        e = doc.to_dict()
+        if e.get("date", "").startswith(current_month):
+            amt              = e.get("amount", 0)
+            total           += amt
+            cat              = e.get("category", "other")
+            by_category[cat] = by_category.get(cat, 0) + amt
+
+    tool_context.state["monthly_total"] = total
+    return {
+        "status":      "success",
+        "month":       current_month,
+        "total_inr":   total,
+        "by_category": by_category
+    }
+
+
+def get_balance_summary(tool_context: ToolContext) -> dict:
+    """
+    Returns income vs expenses balance for the current month.
+    Shows net balance, total income, total expenses.
+    """
+    current_month = datetime.utcnow().strftime("%Y-%m")
+
+    # Total expenses
+    expense_docs = db.collection("expenses").stream()
+    total_exp    = sum(
+        d.to_dict().get("amount", 0) for d in expense_docs
+        if d.to_dict().get("date", "").startswith(current_month)
+    )
+
+    # Total income
+    income_docs  = db.collection("income").stream()
+    total_inc    = sum(
+        d.to_dict().get("amount", 0) for d in income_docs
+        if d.to_dict().get("date", "").startswith(current_month)
+    )
+
+    net_balance = total_inc - total_exp
+
+    summary = {
+        "month":          current_month,
+        "total_income":   f"₹{total_inc:.0f}",
+        "total_expenses": f"₹{total_exp:.0f}",
+        "net_balance":    f"₹{net_balance:.0f}",
+        "status":         "surplus" if net_balance >= 0 else "deficit",
+        "message":        (
+            f"💚 Surplus of ₹{net_balance:.0f} this month"
+            if net_balance >= 0
+            else f"🔴 Deficit of ₹{abs(net_balance):.0f} this month"
+        )
+    }
+
+    tool_context.state["balance_summary"] = summary
+    return {"status": "success", "summary": summary}
+
+
+def delete_expense(tool_context: ToolContext, expense_id: str) -> dict:
+    """Deletes a specific expense by ID."""
+    db.collection("expenses").document(expense_id).delete()
+    return {"status": "success", "message": f"✅ Expense {expense_id} deleted."}
+
+
+def delete_all_expenses(tool_context: ToolContext) -> dict:
+    """Deletes ALL expenses. Use only when user explicitly confirms."""
+    docs    = db.collection("expenses").stream()
+    deleted = 0
+    for doc in docs:
+        doc.reference.delete()
+        deleted += 1
+    return {"status": "success", "message": f"✅ Deleted {deleted} expense records."}
