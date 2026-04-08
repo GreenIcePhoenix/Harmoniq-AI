@@ -84,12 +84,18 @@ class HarmoniqHandler(http.server.SimpleHTTPRequestHandler):
                 method=method,
                 headers={'Content-Type': 'application/json'}
             )
-            with urllib.request.urlopen(req, timeout=180) as resp:
-                data         = resp.read()
-                print(f"[PROXY] Response status: {status}")
-                print(f"[PROXY] Raw response (first 500 chars): {data[:500]}")
-                status       = resp.status
-                content_type = resp.headers.get('Content-Type', 'application/json')
+            for attempt in range(3):
+                try:
+                    with urllib.request.urlopen(req, timeout=180) as resp:
+                        data = resp.read()
+                        status = resp.status
+                        content_type = resp.headers.get('Content-Type', 'application/json')
+                        break
+                except Exception as e:
+                    print(f"[PROXY] Attempt {attempt+1} failed: {e}")
+                    time.sleep(1)
+            else:
+                raise Exception("ADK not reachable after retries")
             try:
                 self.send_response(status)
                 self._cors()
@@ -197,7 +203,6 @@ class HarmoniqHandler(http.server.SimpleHTTPRequestHandler):
 
 
 def start_adk():
-    print("[ADK] Starting ADK process...")
     adk_bin = '/usr/local/bin/adk'
     cmd = [
         adk_bin, 'web',
@@ -206,19 +211,36 @@ def start_adk():
         '--port', str(ADK_PORT),
         '--allow_origins', '*'
     ]
-    print(f"Starting ADK on internal port {ADK_PORT}...")
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    for _ in range(30):
+
+    print("[ADK] Starting ADK process...")
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True
+    )
+
+    # 🔴 STREAM LOGS
+    def stream_logs():
+        for line in proc.stdout:
+            print("[ADK LOG]", line.strip())
+
+    threading.Thread(target=stream_logs, daemon=True).start()
+
+    # 🔴 HARD WAIT LOOP (no assumptions)
+    for i in range(60):  # wait up to 60 seconds
         time.sleep(1)
         try:
             urllib.request.urlopen(
-                f'http://127.0.0.1:{ADK_PORT}/list-apps', timeout=2
+                f'http://127.0.0.1:{ADK_PORT}/list-apps',
+                timeout=2
             )
-            print(f"✅ ADK ready on port {ADK_PORT}")
+            print(f"[ADK] Ready after {i+1}s")
             return proc
-        except:
-            pass
-    print("⚠️  ADK may still be starting...")
+        except Exception as e:
+            print(f"[ADK] Waiting... ({i+1}s)")
+
+    print("❌ ADK failed to start properly")
     return proc
 
 

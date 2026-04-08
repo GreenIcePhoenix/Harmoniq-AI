@@ -1,5 +1,4 @@
 import os
-from dotenv import load_dotenv
 from google.adk.agents import Agent
 from google.adk.tools.tool_context import ToolContext
 
@@ -9,9 +8,6 @@ from harmoniq_app.calendar_agent import calendar_agent
 from harmoniq_app.finance_agent import finance_agent
 from harmoniq_app.insights_agent import insights_agent
 from harmoniq_app.morning_briefing_agent import morning_briefing_agent
-
-load_dotenv()
-
 
 def save_user_request(tool_context: ToolContext, request: str) -> dict:
     """Captures the user request and routes correctly."""

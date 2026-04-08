@@ -1,0 +1,7 @@
+.env
+sa-key.json
+credentials.json.bak
+__pycache__/
+*.pyc
+.hidrix-tools
+harmoniq_app/.adk/

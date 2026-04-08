@@ -1,9 +1,7 @@
 import os
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-
-# Key is at ~/harmoniq-ai-nm/sa-key.json
-SA_KEY_FILE = '/app/agents/harmoniq_app/sa-key.json'
+import google.auth
 
 SCOPES = [
     'https://www.googleapis.com/auth/calendar',
@@ -13,11 +11,8 @@ SCOPES = [
 ]
 
 def get_credentials():
-    """Service account credentials — no OAuth needed."""
-    return service_account.Credentials.from_service_account_file(
-        SA_KEY_FILE,
-        scopes=SCOPES
-    )
+    credentials, _ = google.auth.default(scopes=SCOPES)
+    return credentials
 
 def get_calendar_service():
     return build('calendar', 'v3', credentials=get_credentials())
